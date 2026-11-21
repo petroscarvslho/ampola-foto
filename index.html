@@ -9,7 +9,7 @@
   Guia de foto da ampola — código próprio.
   Bibliotecas de terceiros (carregadas por CDN):
    - OpenCV.js 4.7.0 (Apache-2.0) — https://docs.opencv.org
-   - jscanify 1.4.0 (MIT, puffinsoft/jscanify) — detecção da folha ao vivo
+  A folha é achada pelos 36 quadrados pretos do gabarito (funciona em mesa clara e recusa papel comum).
 -->
 <style>
 :root{--acc:#0b6bcb;--ok:#1fb36b;--warn:#f59e0b;--bad:#ef4444;--ink:#fff}
@@ -75,7 +75,6 @@ button{font:600 16px Figtree,system-ui,sans-serif;color:#fff;background:none;bor
 </section>
 
 <script src="https://docs.opencv.org/4.7.0/opencv.js" async></script>
-<script src="https://cdn.jsdelivr.net/npm/jscanify@1.4.0/src/jscanify.min.js"></script>
 <script>
 {
 const STEPS=[
@@ -86,24 +85,68 @@ const STEPS=[
 const $=id=>document.getElementById(id);
 const v=$('v'),ov=$('ov'),ctx=ov.getContext('2d');
 const work=document.createElement('canvas'),wctx=work.getContext('2d',{willReadFrequently:true});
-let scanner=null,cvReady=false,stream=null,shots=[],okSince=0,lastState='';
+const patch=document.createElement('canvas'),pctx=patch.getContext('2d',{willReadFrequently:true});
+let cvReady=false,stream=null,shots=[],okSince=0,lostSince=0,shown='',pend='',pendN=0,sharpHist=[],saving=false;
+
+// Gabarito A4 em pé, em mm a partir do canto de cima à esquerda: 36 quadrados pretos de 14 mm na borda.
+const RING=[21,20.5,189,20.5,189,276.5,21,276.5];            // cantos externos da moldura de quadrados
+const MK=[];for(let i=0;i<8;i++)for(let j=0;j<12;j++)if(i==0||i==7||j==0||j==11)MK.push([21+22*i,20.5+22*j]);
+// limites (ajustar aqui depois de testar em celular de verdade)
+const T={area:.40,tilt:1.10,sharp:.18,dim:55,present:32};
 
 // só celular e tablet (iPhone, iPad, Android)
 const ua=navigator.userAgent;
 const isIPad=/Macintosh/.test(ua)&&navigator.maxTouchPoints>1;
+const iOS=/iPhone|iPad|iPod/.test(ua)||isIPad;
 const mobile=/Android|iPhone|iPad|iPod/i.test(ua)||isIPad||(navigator.userAgentData&&navigator.userAgentData.mobile);
 if(!mobile&&!location.hash.includes('teste')){$('start').classList.add('hide');$('desk').classList.remove('hide');$('deskUrl').textContent=location.href}
 // navegador dentro do WhatsApp/Instagram costuma bloquear a câmera
 const inApp=/FBAN|FBAV|Instagram|WhatsApp|Line\//i.test(ua);
 if(inApp)$('load').textContent='Abra no Safari ou no Chrome (toque em ••• e "Abrir no navegador"). Dentro do WhatsApp a câmera pode não funcionar.';
 // espera o OpenCV ficar pronto
-const waitCv=setInterval(()=>{if(window.cv&&cv.Mat){clearInterval(waitCv);cvReady=true;scanner=new jscanify();if(!inApp)$('load').textContent='Detector pronto.'}},200);
+const waitCv=setInterval(()=>{if(window.cv&&cv.Mat){clearInterval(waitCv);cvReady=true;if(!inApp)$('load').textContent='Detector pronto.'}},200);
+
+// ---- câmera ----
+async function openCam(){
+  // 4K primeiro; se o aparelho recusar (OverconstrainedError etc.), tenta pedidos mais simples.
+  // resizeMode 'none' (Chrome): usa um modo nativo da câmera em vez de recortar o quadro para caber no pedido.
+  const tries=[{width:{ideal:3840},height:{ideal:2160},resizeMode:{ideal:'none'}},{width:{ideal:1920},height:{ideal:1080}},{}];let err;
+  for(const t of tries){
+    try{return await navigator.mediaDevices.getUserMedia({audio:false,video:Object.assign({facingMode:{ideal:'environment'}},t)})}
+    catch(e){err=e;if(e.name==='NotAllowedError'||e.name==='SecurityError')break}
+  }
+  throw err;
+}
+async function startCam(){
+  stream=await openCam();
+  const tr=stream.getVideoTracks()[0];
+  tr.addEventListener('ended',()=>{if(!document.hidden&&onStage()&&!live())restart()});
+  try{const c=tr.getCapabilities&&tr.getCapabilities();if(c&&c.focusMode&&c.focusMode.includes('continuous'))await tr.applyConstraints({advanced:[{focusMode:'continuous'}]})}catch(e){}
+  v.srcObject=stream;await v.play();
+}
+function stopCam(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}v.srcObject=null;okSince=0;shown=pend='';$('shot').classList.remove('ready');$('msg').textContent='Ligando a câmera…';ctx.clearRect(0,0,ov.width,ov.height)}
+const onStage=()=>!$('stage').classList.contains('hide');
+let restarting=false;
+async function restart(){
+  if(restarting)return;restarting=true;stopCam();okSince=0;
+  try{await startCam()}catch(e){$('msg').textContent='A câmera parou. Toque aqui para ligar de novo.'}
+  restarting=false;
+}
+$('msg').onclick=()=>{if(!stream)restart()};
+// app em segundo plano: solta a câmera; ao voltar, liga de novo
+const live=()=>stream&&stream.getVideoTracks().some(t=>t.readyState==='live');
+document.addEventListener('visibilitychange',()=>{if(!onStage())return;if(document.hidden)stopCam();else if(!live())restart()});
+addEventListener('resize',()=>{okSince=0});
 
 $('go').onclick=async()=>{
-  try{
-    stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:3840},height:{ideal:2160}}});
-  }catch(e){$('load').textContent=(/iPhone|iPad|Macintosh/.test(ua)?'Câmera bloqueada. No iPhone/iPad: Ajustes → Safari → Câmera → Permitir, e recarregue a página.':'Câmera bloqueada. No Android: toque no cadeado ao lado do endereço → Permissões → Câmera → Permitir, e recarregue.');return}
-  v.srcObject=stream;await v.play();
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){$('load').textContent='Este navegador não abre a câmera. Use o Safari (iPhone) ou o Chrome (Android).';return}
+  $('go').disabled=true;
+  try{await startCam()}catch(e){
+    $('go').disabled=false;
+    $('load').textContent=(e.name==='NotAllowedError'||e.name==='SecurityError')
+      ?(iOS?'Câmera bloqueada. No iPhone/iPad: Ajustes → Safari → Câmera → Permitir, e recarregue a página.':'Câmera bloqueada. No Android: toque no cadeado ao lado do endereço → Permissões → Câmera → Permitir, e recarregue.')
+      :'Não consegui abrir a câmera. Feche outros apps que usam a câmera e tente de novo.';
+    return}
   $('start').classList.add('hide');$('stage').classList.remove('hide');
   setStep();requestAnimationFrame(loop);
 };
@@ -113,87 +156,194 @@ function setStep(){const s=STEPS[shots.length];$('step').textContent=s[0];$('sub
   $('redo').classList.toggle('hide',!shots.length)}
 
 // ---- análise de cada quadro ----
+const hp=(M,x,y)=>{const m=M.data64F,w=m[6]*x+m[7]*y+m[8];return{x:(m[0]*x+m[1]*y+m[2])/w,y:(m[3]*x+m[4]*y+m[5])/w}};
 const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
-function judge(c,W,H){
-  if(!c)return['Procurando a folha…',false];
-  const pts=[c.topLeftCorner,c.topRightCorner,c.bottomRightCorner,c.bottomLeftCorner];
-  if(pts.some(p=>!p))return['Procurando a folha…',false];
-  // primeiro: isso parece uma folha A4? (evita falso alarme com mesa, sacola etc.)
-  {const d=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
-   const t0=d(pts[0],pts[1]),b0=d(pts[3],pts[2]),l0=d(pts[0],pts[3]),r0=d(pts[1],pts[2]);
-   let ar0=((l0+r0)/2)/((t0+b0)/2);ar0=Math.max(ar0,1/ar0);
-   let a0=0;for(let i=0;i<4;i++){const p=pts[i],q=pts[(i+1)%4];a0+=p.x*q.y-q.x*p.y}a0=Math.abs(a0)/2/(W*H);
-   const skew=Math.max(t0/b0,b0/t0,l0/r0,r0/l0);
-   if(a0<0.12||ar0<1.2||ar0>1.7||skew>1.6)return['Procurando a folha do gabarito…',false];}
-  const m=0.02;
-  if(pts.some(p=>p.x<W*m||p.x>W*(1-m)||p.y<H*m||p.y>H*(1-m)))return['Afaste um pouco — a folha inteira precisa aparecer',false];
-  // área da folha em relação à tela
-  let a=0;for(let i=0;i<4;i++){const p=pts[i],q=pts[(i+1)%4];a+=p.x*q.y-q.x*p.y}a=Math.abs(a)/2/(W*H);
-  if(a<0.40)return['Chegue mais perto',false];
-  // inclinação: lados opostos devem ter tamanhos parecidos
-  const t=dist(pts[0],pts[1]),b=dist(pts[3],pts[2]),l=dist(pts[0],pts[3]),r=dist(pts[1],pts[2]);
-  const tilt=Math.max(t/b,b/t,l/r,r/l);
-  if(tilt>1.10)return['Endireite o celular — deixe paralelo à mesa',false];
-  // proporção A4 (297/210 ≈ 1,41)
-  const ar=((l+r)/2)/((t+b)/2),arr=Math.max(ar,1/ar);
-  if(arr<1.25||arr>1.6)return['Enquadre só a folha do gabarito',false];
+function areaOf(P){let a=0;for(let i=0;i<4;i++){const p=P[i],q=P[(i+1)%4];a+=p.x*q.y-q.x*p.y}return Math.abs(a)/2}
+function pct(h,n,q){let k=n*q,s=0;for(let i=0;i<256;i++){s+=h[i];if(s>=k)return i}return 255}
+
+// acha os quadrados pretos do gabarito e, por eles, a folha (não depende da cor da mesa)
+function detect(V){
+  const W=work.width,H=work.height,del=[],K=m=>(del.push(m),m);
+  try{
+    const src=K(cv.imread(work)),g=K(new cv.Mat());cv.cvtColor(src,g,cv.COLOR_RGBA2GRAY);
+    const bin=K(new cv.Mat());cv.adaptiveThreshold(g,bin,255,cv.ADAPTIVE_THRESH_MEAN_C,cv.THRESH_BINARY_INV,(Math.max(W,H)/12|0)|1,15);
+    const cs=K(new cv.MatVector()),hi=K(new cv.Mat());cv.findContours(bin,cs,hi,cv.RETR_LIST,cv.CHAIN_APPROX_SIMPLE);
+    let B=[];const amin=W*H*8e-5,amax=W*H*.02;
+    for(let i=0;i<cs.size();i++){
+      const c=cs.get(i),a=cv.contourArea(c);
+      if(a>amin&&a<amax){
+        const ap=new cv.Mat();cv.approxPolyDP(c,ap,.12*cv.arcLength(c,true),true);
+        if(ap.rows===4&&cv.isContourConvex(ap)){
+          const d=ap.data32S,P=[0,1,2,3].map(k=>({x:d[2*k],y:d[2*k+1]})),pa=areaOf(P);
+          const s=[0,1,2,3].map(k=>dist(P[k],P[(k+1)%4]));
+          if(a>.7*pa&&a<1.25*pa&&Math.max(...s)<2.5*Math.min(...s))B.push({a,P,x:(d[0]+d[2]+d[4]+d[6])/4,y:(d[1]+d[3]+d[5]+d[7])/4});
+        }
+        ap.delete();
+      }
+      c.delete();
+    }
+    // só fica quem tem vizinho parecido a ~1,6 lado de distância (como na moldura); descarta manchas soltas
+    B=B.filter(b=>{const r=Math.sqrt(b.a);return B.some(o=>{if(o===b||o.a<b.a*.5||o.a>b.a*2)return false;const d=Math.hypot(o.x-b.x,o.y-b.y);return d>1.2*r&&d<2.4*r})});
+    const r={n:B.length};
+    if(B.length>=4){const m=.01*Math.max(V.w,V.h);
+      r.edge=B.some(b=>b.P.some(p=>p.x<V.x+m||p.x>V.x+V.w-m||p.y<V.y+m||p.y>V.y+V.h-m));}
+    if(B.length<12||r.edge)return r;
+    // contorno externo de todos os quadrados → 4 cantos da moldura
+    const pts=K(cv.matFromArray(B.length*4,1,cv.CV_32SC2,B.flatMap(b=>b.P.flatMap(p=>[p.x,p.y])))),hull=K(new cv.Mat());
+    cv.convexHull(pts,hull,false,true);
+    const q=K(new cv.Mat()),per=cv.arcLength(hull,true);
+    for(let e=.01;e<.1;e+=.01){cv.approxPolyDP(hull,q,e*per,true);if(q.rows<=4)break}
+    if(q.rows!==4)return r;
+    let Q=[0,1,2,3].map(k=>({x:q.data32S[2*k],y:q.data32S[2*k+1]}));
+    const cx=(Q[0].x+Q[1].x+Q[2].x+Q[3].x)/4,cy=(Q[0].y+Q[1].y+Q[2].y+Q[3].y)/4;
+    Q.sort((a,b)=>Math.atan2(a.y-cy,a.x-cx)-Math.atan2(b.y-cy,b.x-cx));               // sentido horário na tela
+    if(dist(Q[0],Q[1])+dist(Q[2],Q[3])>dist(Q[1],Q[2])+dist(Q[3],Q[0]))Q.push(Q.shift()); // Q0→Q1 = lado curto
+    const qi=Q.flatMap(p=>[p.x,p.y]);
+    const Hi=K(cv.getPerspectiveTransform(K(cv.matFromArray(4,1,cv.CV_32FC2,RING)),K(cv.matFromArray(4,1,cv.CV_32FC2,qi)))); // mm → imagem
+    r.ring=Q;r.paper=[[0,0],[210,0],[210,297],[0,297]].map(([x,y])=>hp(Hi,x,y));r.Hi=Hi.data64F.slice();
+    // folha retificada (~resolução da imagem) para conferir os quadrados e a luz
+    const s=Math.min(1.2,Math.max(.35,(dist(Q[1],Q[2])+dist(Q[3],Q[0]))/2/256)),ww=Math.round(210*s),wh=Math.round(297*s);
+    const Mw=K(cv.getPerspectiveTransform(K(cv.matFromArray(4,1,cv.CV_32FC2,qi)),K(cv.matFromArray(4,1,cv.CV_32FC2,RING.map(z=>z*s)))));
+    const wp=K(new cv.Mat());cv.warpPerspective(g,wp,Mw,new cv.Size(ww,wh),cv.INTER_LINEAR,cv.BORDER_CONSTANT,new cv.Scalar(0));
+    const D=wp.data,h=new Uint32Array(256);for(let i=0;i<D.length;i++)h[D[i]]++;
+    const dark=pct(h,D.length,.03),lum=pct(h,D.length,.7),thr=(dark+lum)/2;
+    let present=0;
+    for(const [mx,my] of MK){let n=0,k=0;
+      for(let y=Math.round((my+1.5)*s);y<Math.round((my+12.5)*s);y++)for(let x=Math.round((mx+1.5)*s);x<Math.round((mx+12.5)*s);x++){k++;if(D[y*ww+x]<thr)n++}
+      const f=n/k;if(f>.35&&f<.97)present++}
+    let clip=0,nc=0;for(let y=Math.round(45*s);y<Math.round(250*s);y+=2)for(let x=Math.round(45*s);x<Math.round(165*s);x+=2){nc++;if(D[y*ww+x]>=250)clip++}
+    Object.assign(r,{present,lum,dark,clip:clip/nc});
+    return r;
+  }catch(e){return{n:0,err:String(e)}}
+  finally{del.forEach(m=>m.delete())}
+}
+
+// nitidez medida na resolução real do vídeo, num recorte em volta de 2 quadrados
+function sharpness(r,sc){
+  const Hi={data64F:r.Hi};let best=0;
+  for(const [mx,my] of [[28,159.5],[182,159.5]]){
+    const C=[[-11,-11],[11,-11],[11,11],[-11,11]].map(([a,b])=>hp(Hi,mx+a,my+b));
+    const x0=Math.max(0,Math.min(...C.map(p=>p.x))/sc),y0=Math.max(0,Math.min(...C.map(p=>p.y))/sc);
+    const x1=Math.min(v.videoWidth,Math.max(...C.map(p=>p.x))/sc),y1=Math.min(v.videoHeight,Math.max(...C.map(p=>p.y))/sc);
+    const sw=x1-x0,sh=y1-y0;if(sw<12||sh<12)continue;
+    const k=Math.min(1,160/Math.max(sw,sh)),pw=Math.round(sw*k),ph=Math.round(sh*k);
+    patch.width=pw;patch.height=ph;pctx.drawImage(v,x0,y0,sw,sh,0,0,pw,ph);
+    const d=pctx.getImageData(0,0,pw,ph).data,G=new Uint8Array(pw*ph);
+    for(let i=0,j=0;j<G.length;i+=4,j++)G[j]=(77*d[i]+150*d[i+1]+29*d[i+2])>>8;
+    const hI=new Uint32Array(256),hx=new Uint32Array(256),hy=new Uint32Array(256);
+    for(let y=0;y<ph-1;y++)for(let x=0;x<pw-1;x++){const i=y*pw+x;hI[G[i]]++;hx[Math.abs(G[i+1]-G[i])]++;hy[Math.abs(G[i+pw]-G[i])]++}
+    const n=(pw-1)*(ph-1),ppm=pw/22,top=Math.max(3,14*ppm)/n;   // ~ um lado de quadrado em pixels de borda
+    const con=Math.max(20,pct(hI,n,.95)-pct(hI,n,.05));
+    best=Math.max(best,Math.min(pct(hx,n,1-top),pct(hy,n,1-top))/con);
+    if(best>=T.sharp)break;   // um recorte nítido basta (poupa ler o vídeo em 4K de novo)
+  }
+  return best;
+}
+
+function judge(r,V,sc){
+  if(!r.ring){
+    if(r.edge)return['Afaste um pouco — a folha inteira precisa aparecer',false];
+    return[performance.now()-lostSince>3000?'Procurando a folha do gabarito — a impressa, com os quadradinhos pretos':'Procurando a folha do gabarito…',false];
+  }
+  const P=r.paper,m=.015*Math.max(V.w,V.h);
+  if(r.ring.some(p=>p.x<V.x+m||p.x>V.x+V.w-m||p.y<V.y+m||p.y>V.y+V.h-m))return['Afaste um pouco — a folha inteira precisa aparecer',false];
+  if(areaOf(P)/(V.w*V.h)<T.area){
+    // ângulo do lado comprido da folha em relação ao lado comprido da tela (0° = alinhados)
+    const lx=Math.abs(P[1].x-P[2].x+P[0].x-P[3].x),ly=Math.abs(P[1].y-P[2].y+P[0].y-P[3].y);
+    let ang=Math.atan2(lx,ly)*180/Math.PI;if(V.w>V.h)ang=90-ang;
+    if(ang>45)return[V.h>V.w?'Gire a folha: deixe-a em pé, como a tela':'Gire a folha: deixe-a deitada, como a tela',false];
+    if(ang>12)return['Alinhe a folha com a tela',false];
+    return['Chegue mais perto',false];
+  }
+  if(r.lum<T.dim)return['Pouca luz — acenda a luz do ambiente',false];
+  if(r.clip>.5)return['Luz forte demais — tire do sol direto',false];
+  if(r.present<T.present)return['Deixe todos os quadrados pretos à mostra',false];
+  const t=dist(P[0],P[1]),b=dist(P[3],P[2]),l=dist(P[0],P[3]),rr=dist(P[1],P[2]);
+  if(Math.max(t/b,b/t,l/rr,rr/l)>T.tilt)return['Endireite o celular — deixe paralelo à mesa',false];
+  sharpHist.push(sharpness(r,sc));if(sharpHist.length>3)sharpHist.shift();
+  r.sharp=Math.max(...sharpHist);
+  if(r.sharp<T.sharp)return['Segure firme — está tremido',false];
   return['Perfeito — segure firme',true];
 }
-function sharpness(){ // variância do Laplaciano numa amostra central
-  const W=work.width,H=work.height,x0=W*.3|0,y0=H*.35|0,w=W*.4|0,h=H*.3|0;
-  const d=wctx.getImageData(x0,y0,w,h).data;let s=0,s2=0,n=0;
-  const g=i=>.3*d[i]+.59*d[i+1]+.11*d[i+2];
-  for(let y=1;y<h-1;y+=2)for(let x=1;x<w-1;x+=2){const i=(y*w+x)*4;const L=4*g(i)-g(i-4)-g(i+4)-g(i-4*w)-g(i+4*w);s+=L;s2+=L*L;n++}
-  return s2/n-(s/n)**2;
-}
+
 let last=0;
 function loop(t){
   requestAnimationFrame(loop);
-  if(!cvReady||!v.videoWidth||t-last<250)return; last=t;
-  const vw=v.videoWidth,vh=v.videoHeight,sc=480/Math.max(vw,vh);
-  work.width=Math.round(vw*sc);work.height=Math.round(vh*sc);wctx.drawImage(v,0,0,work.width,work.height);
-  let corners=null;
-  try{const img=cv.imread(work);const cont=scanner.findPaperContour(img);if(cont){corners=scanner.getCornerPoints(cont,img);cont.delete()}img.delete()}catch(e){}
-  let [txt,ok]=judge(corners,work.width,work.height);
-  if(ok&&sharpness()<40){txt='Segure firme — está tremido';ok=false}
-  draw(corners,ok,vw,vh,sc);
+  if(!cvReady||!stream||!v.videoWidth||document.hidden||t-last<250)return; last=t;
+  const vw=v.videoWidth,vh=v.videoHeight,sc=480/Math.max(vw,vh),ww=Math.round(vw*sc),wh=Math.round(vh*sc);
+  if(work.width!==ww||work.height!==wh){work.width=ww;work.height=wh}
+  wctx.drawImage(v,0,0,ww,wh);
+  // parte do vídeo que aparece na tela (object-fit: cover corta as laterais), em pixels da análise
+  const R=ov.getBoundingClientRect(),k=Math.max(R.width/vw,R.height/vh);
+  const V={w:R.width/k*sc,h:R.height/k*sc};V.x=(ww-V.w)/2;V.y=(wh-V.h)/2;
+  const t0=performance.now(),r=detect(V);
+  if(!r.ring&&!lostSince)lostSince=performance.now();else if(r.ring)lostSince=0;
+  let [txt,ok]=judge(r,V,sc);
+  if(!ok)sharpHist.length=0;
+  r.ms=performance.now()-t0;window.__dbg=r;  // para os testes automáticos
+  draw(r.paper,ok,vw,vh,sc,R);
   const now=performance.now();
   if(ok){if(!okSince)okSince=now}else okSince=0;
   const ready=ok&&now-okSince>600;
-  $('shot').disabled=false;$('shot').classList.toggle('ready',ready);
-  $('msg').textContent=ready?'Pode tirar a foto ✓':txt;
+  $('shot').disabled=saving;$('shot').classList.toggle('ready',ready);
+  // troca a mensagem só se ela se repetir (evita piscar)
+  const want=ready?'Pode tirar a foto ✓':txt;
+  if(want===pend)pendN++;else{pend=want;pendN=1}
+  if(want!==shown&&(pendN>=2||ready||!shown)){shown=want;$('msg').textContent=want}
 }
-function draw(c,ok,vw,vh,sc){
-  const R=ov.getBoundingClientRect();ov.width=R.width*devicePixelRatio;ov.height=R.height*devicePixelRatio;
-  ctx.clearRect(0,0,ov.width,ov.height);if(!c||!c.topLeftCorner)return;
+function draw(P,ok,vw,vh,sc,R){
+  const W=Math.round(R.width*devicePixelRatio),H=Math.round(R.height*devicePixelRatio);
+  if(ov.width!==W||ov.height!==H){ov.width=W;ov.height=H}
+  ctx.clearRect(0,0,W,H);if(!P)return;
   // mapeia coordenadas do vídeo (object-fit:cover) para a tela
-  const k=Math.max(ov.width/vw,ov.height/vh),ox=(ov.width-vw*k)/2,oy=(ov.height-vh*k)/2;
-  const P=p=>[p.x/sc*k+ox,p.y/sc*k+oy];
+  const k=Math.max(W/vw,H/vh),ox=(W-vw*k)/2,oy=(H-vh*k)/2;
   ctx.lineWidth=4*devicePixelRatio;ctx.strokeStyle=ok?'#1fb36b':'#f59e0b';ctx.beginPath();
-  [c.topLeftCorner,c.topRightCorner,c.bottomRightCorner,c.bottomLeftCorner].forEach((p,i)=>{const [x,y]=P(p);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
+  P.forEach((p,i)=>{const x=p.x/sc*k+ox,y=p.y/sc*k+oy;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
   ctx.closePath();ctx.stroke();
 }
 
 // ---- foto ----
-$('shot').onclick=()=>{
-  const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);
-  c.toBlob(b=>{shots.push(b);const im=new Image();im.src=URL.createObjectURL(b);$('thumbs').appendChild(im);
+// Android/Chrome: tenta a foto cheia do sensor (ImageCapture); senão, usa o quadro do vídeo
+async function grab(){
+  const tr=stream&&stream.getVideoTracks()[0],vw=v.videoWidth,vh=v.videoHeight;
+  if(window.ImageCapture&&tr&&!iOS){
+    try{
+      const ic=new ImageCapture(tr),shoot=async()=>{ // sem flash, se o aparelho deixar escolher
+        const pc=await ic.getPhotoCapabilities().catch(()=>null);
+        return ic.takePhoto(pc&&pc.fillLightMode&&pc.fillLightMode.includes('off')?{fillLightMode:'off'}:undefined)};
+      const b=await Promise.race([shoot(),new Promise((_,no)=>setTimeout(()=>no(new Error('tempo')),3500))]);
+      const bm=await createImageBitmap(b),ok=(bm.width>bm.height)===(vw>vh)&&bm.width*bm.height>=vw*vh;
+      bm.close&&bm.close();
+      if(ok)return b;
+    }catch(e){}
+  }
+  const c=document.createElement('canvas');c.width=vw;c.height=vh;c.getContext('2d').drawImage(v,0,0);
+  return await new Promise(res=>c.toBlob(res,'image/jpeg',0.95));
+}
+$('shot').onclick=async()=>{
+  if(saving||!stream||!v.videoWidth)return;
+  saving=true;$('shot').disabled=true;
+  try{
+    const b=await grab();if(!b)throw 0;
+    shots.push(b);const im=new Image();im.src=URL.createObjectURL(b);$('thumbs').appendChild(im);
     if(navigator.vibrate)navigator.vibrate(40);
-    if(shots.length===4)finish();else{okSince=0;setStep()}},'image/jpeg',0.95);
+    if(shots.length===4)finish();else{okSince=0;setStep()}
+  }catch(e){$('msg').textContent='Não consegui salvar a foto. Tente de novo.'}
+  saving=false;$('shot').disabled=false;
 };
 $('redo').onclick=()=>{shots.pop();$('thumbs').lastChild&&$('thumbs').lastChild.remove();setStep()};
 
 function finish(){
-  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stopCam();
   $('stage').classList.add('hide');$('done').classList.remove('hide');
   $('grid').innerHTML='';shots.forEach((b,i)=>{const im=new Image();im.alt='Foto '+(i+1);im.src=URL.createObjectURL(b);$('grid').appendChild(im)});
 }
-const files=()=>shots.map((b,i)=>new File([b],`ampola_foto${i+1}.jpg`,{type:'image/jpeg'}));
+const files=()=>shots.map((b,i)=>{const t=b.type||'image/jpeg';return new File([b],`ampola_foto${i+1}.${t==='image/png'?'png':'jpg'}`,{type:t})});
 $('share').onclick=async()=>{
   const f=files();
-  if(navigator.canShare&&navigator.canShare({files:f})){try{await navigator.share({files:f,title:'Fotos da ampola'});return}catch(e){if(e.name==='AbortError')return}}
-  // alternativa: baixar uma por uma
-  f.forEach(x=>{const a=document.createElement('a');a.href=URL.createObjectURL(x);a.download=x.name;document.body.appendChild(a);a.click();a.remove()});
+  if(navigator.canShare&&navigator.canShare({files:f})){try{await navigator.share({files:f});return}catch(e){if(e.name==='AbortError')return}}
+  // alternativa: baixar uma por uma (com intervalo, senão o navegador bloqueia as seguintes)
+  f.forEach((x,i)=>setTimeout(()=>{const a=document.createElement('a');a.href=URL.createObjectURL(x);a.download=x.name;document.body.appendChild(a);a.click();a.remove()},i*700));
   $('shareNote').textContent='As fotos foram baixadas. Envie as 4 pelo WhatsApp.';
 };
 $('again').onclick=()=>location.reload();

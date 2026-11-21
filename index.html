@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Foto da ampola</title>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;600;700&display=swap" rel="stylesheet">
+<!--
+  Guia de foto da ampola — código próprio.
+  Bibliotecas de terceiros (carregadas por CDN):
+   - OpenCV.js 4.7.0 (Apache-2.0) — https://docs.opencv.org
+   - jscanify 1.4.0 (MIT, puffinsoft/jscanify) — detecção da folha ao vivo
+-->
+<style>
+:root{--acc:#0b6bcb;--ok:#1fb36b;--warn:#f59e0b;--bad:#ef4444;--ink:#fff}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#000;color:var(--ink);font:16px/1.45 Figtree,system-ui,sans-serif;overflow:hidden}
+#stage{position:fixed;inset:0}
+video,#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#top{position:absolute;left:0;right:0;top:0;padding:calc(env(safe-area-inset-top) + 12px) 16px 14px;background:linear-gradient(#000c,#0000)}
+#step{font-weight:700;font-size:20px}
+#sub{opacity:.85;font-size:15px}
+#dots{display:flex;gap:6px;margin-top:8px}#dots i{flex:1;height:5px;border-radius:3px;background:#fff4}#dots i.on{background:var(--ok)}
+#msg{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);padding:12px 18px;border-radius:14px;background:#000a;font-weight:700;font-size:19px;text-align:center;max-width:86vw;backdrop-filter:blur(6px)}
+#bottom{position:absolute;left:0;right:0;bottom:0;padding:16px 16px calc(env(safe-area-inset-bottom) + 18px);display:flex;align-items:center;justify-content:space-between;gap:12px;background:linear-gradient(#0000,#000c)}
+#shot{width:78px;height:78px;border-radius:50%;border:5px solid #fff;background:#fff3;transition:background .2s,transform .1s}
+#shot.ready{background:var(--ok)}#shot:active{transform:scale(.94)}#shot:disabled{opacity:.45}
+#thumbs{display:flex;gap:6px;width:110px}#thumbs img{width:34px;height:46px;object-fit:cover;border-radius:6px;border:2px solid #fff}
+.side{width:110px;text-align:right}
+button{font:600 16px Figtree,system-ui,sans-serif;color:#fff;background:none;border:0;min-height:44px;cursor:pointer}
+#start,#done{position:fixed;inset:0;background:#0f1316;display:flex;flex-direction:column;justify-content:center;padding:28px;gap:14px}
+#start h1,#done h1{font-size:32px;line-height:1.1;margin:0}
+#start p,#done p{margin:0;color:#c9d4dc}
+.big{background:var(--acc);border-radius:14px;min-height:54px;font-size:18px;width:100%}
+.ghost{border:1.5px solid #fff6;border-radius:14px;min-height:50px;width:100%}
+#grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}#grid img{width:100%;aspect-ratio:3/4;object-fit:cover;border-radius:10px}
+#load{font-size:14px;color:#9fb0bc}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<div id="stage" class="hide">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="ov"></canvas>
+  <div id="top"><div id="step"></div><div id="sub"></div><div id="dots"><i></i><i></i><i></i><i></i></div></div>
+  <div id="msg">Procurando a folha…</div>
+  <div id="bottom">
+    <div id="thumbs"></div>
+    <button id="shot" aria-label="Tirar foto" disabled></button>
+    <div class="side"><button id="redo" class="hide">Refazer</button></div>
+  </div>
+</div>
+
+<section id="start">
+  <h1>Foto da ampola</h1>
+  <p>4 fotos com a ampola deitada no gabarito. A tela avisa quando a folha está bem enquadrada; aí o botão fica verde.</p>
+  <p>Luz clara, sem flash. Só a ampola na folha — nada de etiqueta de paciente.</p>
+  <button class="big" id="go">Abrir câmera</button>
+  <p id="load">Carregando o detector…</p>
+</section>
+
+<section id="desk" class="hide" style="position:fixed;inset:0;background:#0f1316;display:flex;flex-direction:column;justify-content:center;padding:28px;gap:14px">
+  <h1 style="font-size:32px;margin:0">Abra no celular ou tablet</h1>
+  <p style="color:#c9d4dc;margin:0">Esta ferramenta usa a câmera traseira. Abra este mesmo link no iPhone, iPad ou Android.</p>
+  <p id="deskUrl" style="font-weight:700;word-break:break-all;margin:0"></p>
+</section>
+
+<section id="done" class="hide">
+  <h1>Pronto! 4 fotos.</h1>
+  <p>Agora envie pelo WhatsApp para o Petros.</p>
+  <div id="grid"></div>
+  <button class="big" id="share">Enviar fotos</button>
+  <button class="ghost" id="again">Começar de novo</button>
+  <p id="shareNote" style="font-size:14px"></p>
+</section>
+
+<script src="https://docs.opencv.org/4.7.0/opencv.js" async></script>
+<script src="https://cdn.jsdelivr.net/npm/jscanify@1.4.0/src/jscanify.min.js"></script>
+<script>
+{
+const STEPS=[
+ ["Foto 1 de 4","Ampola deitada no tracejado, rótulo virado para cima."],
+ ["Foto 2 de 4","Role a ampola 1/4 de volta com o dedo."],
+ ["Foto 3 de 4","Role mais 1/4 de volta."],
+ ["Foto 4 de 4","Role o último 1/4 de volta."]];
+const $=id=>document.getElementById(id);
+const v=$('v'),ov=$('ov'),ctx=ov.getContext('2d');
+const work=document.createElement('canvas'),wctx=work.getContext('2d',{willReadFrequently:true});
+let scanner=null,cvReady=false,stream=null,shots=[],okSince=0,lastState='';
+
+// só celular e tablet (iPhone, iPad, Android)
+const ua=navigator.userAgent;
+const isIPad=/Macintosh/.test(ua)&&navigator.maxTouchPoints>1;
+const mobile=/Android|iPhone|iPad|iPod/i.test(ua)||isIPad||(navigator.userAgentData&&navigator.userAgentData.mobile);
+if(!mobile&&!location.hash.includes('teste')){$('start').classList.add('hide');$('desk').classList.remove('hide');$('deskUrl').textContent=location.href}
+// navegador dentro do WhatsApp/Instagram costuma bloquear a câmera
+const inApp=/FBAN|FBAV|Instagram|WhatsApp|Line\//i.test(ua);
+if(inApp)$('load').textContent='Abra no Safari ou no Chrome (toque em ••• e "Abrir no navegador"). Dentro do WhatsApp a câmera pode não funcionar.';
+// espera o OpenCV ficar pronto
+const waitCv=setInterval(()=>{if(window.cv&&cv.Mat){clearInterval(waitCv);cvReady=true;scanner=new jscanify();if(!inApp)$('load').textContent='Detector pronto.'}},200);
+
+$('go').onclick=async()=>{
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:3840},height:{ideal:2160}}});
+  }catch(e){$('load').textContent=(/iPhone|iPad|Macintosh/.test(ua)?'Câmera bloqueada. No iPhone/iPad: Ajustes → Safari → Câmera → Permitir, e recarregue a página.':'Câmera bloqueada. No Android: toque no cadeado ao lado do endereço → Permissões → Câmera → Permitir, e recarregue.');return}
+  v.srcObject=stream;await v.play();
+  $('start').classList.add('hide');$('stage').classList.remove('hide');
+  setStep();requestAnimationFrame(loop);
+};
+
+function setStep(){const s=STEPS[shots.length];$('step').textContent=s[0];$('sub').textContent=s[1];
+  [...$('dots').children].forEach((d,i)=>d.classList.toggle('on',i<shots.length));
+  $('redo').classList.toggle('hide',!shots.length)}
+
+// ---- análise de cada quadro ----
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+function judge(c,W,H){
+  if(!c)return['Procurando a folha…',false];
+  const pts=[c.topLeftCorner,c.topRightCorner,c.bottomRightCorner,c.bottomLeftCorner];
+  if(pts.some(p=>!p))return['Procurando a folha…',false];
+  const m=0.02;
+  if(pts.some(p=>p.x<W*m||p.x>W*(1-m)||p.y<H*m||p.y>H*(1-m)))return['Afaste um pouco — a folha inteira precisa aparecer',false];
+  // área da folha em relação à tela
+  let a=0;for(let i=0;i<4;i++){const p=pts[i],q=pts[(i+1)%4];a+=p.x*q.y-q.x*p.y}a=Math.abs(a)/2/(W*H);
+  if(a<0.40)return['Chegue mais perto',false];
+  // inclinação: lados opostos devem ter tamanhos parecidos
+  const t=dist(pts[0],pts[1]),b=dist(pts[3],pts[2]),l=dist(pts[0],pts[3]),r=dist(pts[1],pts[2]);
+  const tilt=Math.max(t/b,b/t,l/r,r/l);
+  if(tilt>1.10)return['Endireite o celular — deixe paralelo à mesa',false];
+  // proporção A4 (297/210 ≈ 1,41)
+  const ar=((l+r)/2)/((t+b)/2),arr=Math.max(ar,1/ar);
+  if(arr<1.25||arr>1.6)return['Enquadre só a folha do gabarito',false];
+  return['Perfeito — segure firme',true];
+}
+function sharpness(){ // variância do Laplaciano numa amostra central
+  const W=work.width,H=work.height,x0=W*.3|0,y0=H*.35|0,w=W*.4|0,h=H*.3|0;
+  const d=wctx.getImageData(x0,y0,w,h).data;let s=0,s2=0,n=0;
+  const g=i=>.3*d[i]+.59*d[i+1]+.11*d[i+2];
+  for(let y=1;y<h-1;y+=2)for(let x=1;x<w-1;x+=2){const i=(y*w+x)*4;const L=4*g(i)-g(i-4)-g(i+4)-g(i-4*w)-g(i+4*w);s+=L;s2+=L*L;n++}
+  return s2/n-(s/n)**2;
+}
+let last=0;
+function loop(t){
+  requestAnimationFrame(loop);
+  if(!cvReady||!v.videoWidth||t-last<250)return; last=t;
+  const vw=v.videoWidth,vh=v.videoHeight,sc=480/Math.max(vw,vh);
+  work.width=Math.round(vw*sc);work.height=Math.round(vh*sc);wctx.drawImage(v,0,0,work.width,work.height);
+  let corners=null;
+  try{const img=cv.imread(work);const cont=scanner.findPaperContour(img);if(cont){corners=scanner.getCornerPoints(cont,img);cont.delete()}img.delete()}catch(e){}
+  let [txt,ok]=judge(corners,work.width,work.height);
+  if(ok&&sharpness()<40){txt='Segure firme — está tremido';ok=false}
+  draw(corners,ok,vw,vh,sc);
+  const now=performance.now();
+  if(ok){if(!okSince)okSince=now}else okSince=0;
+  const ready=ok&&now-okSince>600;
+  $('shot').disabled=false;$('shot').classList.toggle('ready',ready);
+  $('msg').textContent=ready?'Pode tirar a foto ✓':txt;
+}
+function draw(c,ok,vw,vh,sc){
+  const R=ov.getBoundingClientRect();ov.width=R.width*devicePixelRatio;ov.height=R.height*devicePixelRatio;
+  ctx.clearRect(0,0,ov.width,ov.height);if(!c||!c.topLeftCorner)return;
+  // mapeia coordenadas do vídeo (object-fit:cover) para a tela
+  const k=Math.max(ov.width/vw,ov.height/vh),ox=(ov.width-vw*k)/2,oy=(ov.height-vh*k)/2;
+  const P=p=>[p.x/sc*k+ox,p.y/sc*k+oy];
+  ctx.lineWidth=4*devicePixelRatio;ctx.strokeStyle=ok?'#1fb36b':'#f59e0b';ctx.beginPath();
+  [c.topLeftCorner,c.topRightCorner,c.bottomRightCorner,c.bottomLeftCorner].forEach((p,i)=>{const [x,y]=P(p);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
+  ctx.closePath();ctx.stroke();
+}
+
+// ---- foto ----
+$('shot').onclick=()=>{
+  const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);
+  c.toBlob(b=>{shots.push(b);const im=new Image();im.src=URL.createObjectURL(b);$('thumbs').appendChild(im);
+    if(navigator.vibrate)navigator.vibrate(40);
+    if(shots.length===4)finish();else{okSince=0;setStep()}},'image/jpeg',0.95);
+};
+$('redo').onclick=()=>{shots.pop();$('thumbs').lastChild&&$('thumbs').lastChild.remove();setStep()};
+
+function finish(){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  $('stage').classList.add('hide');$('done').classList.remove('hide');
+  $('grid').innerHTML='';shots.forEach((b,i)=>{const im=new Image();im.alt='Foto '+(i+1);im.src=URL.createObjectURL(b);$('grid').appendChild(im)});
+}
+const files=()=>shots.map((b,i)=>new File([b],`ampola_foto${i+1}.jpg`,{type:'image/jpeg'}));
+$('share').onclick=async()=>{
+  const f=files();
+  if(navigator.canShare&&navigator.canShare({files:f})){try{await navigator.share({files:f,title:'Fotos da ampola'});return}catch(e){if(e.name==='AbortError')return}}
+  // alternativa: baixar uma por uma
+  f.forEach(x=>{const a=document.createElement('a');a.href=URL.createObjectURL(x);a.download=x.name;document.body.appendChild(a);a.click();a.remove()});
+  $('shareNote').textContent='As fotos foram baixadas. Envie as 4 pelo WhatsApp.';
+};
+$('again').onclick=()=>location.reload();
+}
+</script>
+</body>
+</html>
